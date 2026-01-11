@@ -1,0 +1,207 @@
+name: Build Polaris Docker Image
+
+on:
+  # Scheduled builds
+  #schedule:
+    # Monthly on the 1st at 2:00 AM UTC
+    #- cron: '0 2 1 * *'
+  
+  # Manual trigger with optional overrides
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: 'Source repository (owner/repo for GitHub)'
+        required: false
+        type: string
+        default: 'ogarcia/docker-polaris'
+      source_branch:
+        description: 'Branch to build from'
+        required: false
+        type: string
+        default: 'master'
+      polaris_version:
+        description: 'Polaris version to build (e.g., 0.15.0)'
+        required: false
+        type: string
+        default: '0.15.0'
+      alpine_version:
+        description: 'Alpine version to use (e.g., 3.19)'
+        required: false
+        type: string
+        default: '3.23'
+      custom_tag:
+        description: 'Custom tag (optional, in addition to version tags)'
+        required: false
+        type: string
+
+env:
+  # Source repository to clone and build
+  SOURCE_REPO: ogarcia/docker-polaris
+  
+  # Branch to build from
+  SOURCE_BRANCH: master
+  
+  # Your GHCR package name (CUSTOMIZE THIS)
+  GHCR_IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/polaris
+  
+  # Path to Dockerfile in the source repo
+  DOCKERFILE_PATH: ./Dockerfile
+  
+  # Build context path
+  BUILD_CONTEXT: .
+  
+  # Polaris version
+  POLARIS_VERSION: '0.15.0'
+  
+  # Alpine version
+  ALPINE_VERSION: '3.23'
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+      - name: Set repository and branch
+        id: repo_info
+        run: |
+          if [ -n "${{ github.event.inputs.source_repo }}" ]; then
+            REPO="${{ github.event.inputs.source_repo }}"
+          else
+            REPO="${{ env.SOURCE_REPO }}"
+          fi
+          
+          # Convert to full GitHub URL if needed
+          if [[ ! "$REPO" =~ ^https?:// ]] && [[ ! "$REPO" =~ ^git@ ]]; then
+            REPO="https://github.com/${REPO}"
+          fi
+          
+          echo "repo=$REPO" >> $GITHUB_OUTPUT
+          
+          if [ -n "${{ github.event.inputs.source_branch }}" ]; then
+            echo "branch=${{ github.event.inputs.source_branch }}" >> $GITHUB_OUTPUT
+          else
+            echo "branch=${{ env.SOURCE_BRANCH }}" >> $GITHUB_OUTPUT
+          fi
+          
+          # Set Polaris version
+          if [ -n "${{ github.event.inputs.polaris_version }}" ]; then
+            echo "polaris_version=${{ github.event.inputs.polaris_version }}" >> $GITHUB_OUTPUT
+          else
+            echo "polaris_version=${{ env.POLARIS_VERSION }}" >> $GITHUB_OUTPUT
+          fi
+          
+          # Set Alpine version
+          if [ -n "${{ github.event.inputs.alpine_version }}" ]; then
+            echo "alpine_version=${{ github.event.inputs.alpine_version }}" >> $GITHUB_OUTPUT
+          else
+            echo "alpine_version=${{ env.ALPINE_VERSION }}" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Clone source repository
+        run: |
+          echo "Cloning repository: ${{ steps.repo_info.outputs.repo }}"
+          echo "Branch: ${{ steps.repo_info.outputs.branch }}"
+          
+          REPO_URL="${{ steps.repo_info.outputs.repo }}"
+          if [ -n "${{ secrets.SOURCE_REPO_PAT }}" ]; then
+            if [[ "$REPO_URL" =~ ^https://github.com/ ]]; then
+              REPO_URL=$(echo "$REPO_URL" | sed "s|https://github.com/|https://${{ secrets.SOURCE_REPO_PAT }}@github.com/|")
+            fi
+          fi
+          
+          git clone --depth 1 --branch ${{ steps.repo_info.outputs.branch }} \
+            "$REPO_URL" ./target-repo
+          
+          cd ./target-repo
+          echo "Repository cloned successfully"
+          echo "Current directory contents:"
+          ls -la
+      
+      - name: Get commit SHA
+        id: commit
+        run: |
+          cd ./target-repo
+          COMMIT_SHA=$(git rev-parse --short HEAD)
+          echo "sha=$COMMIT_SHA" >> $GITHUB_OUTPUT
+          echo "Commit SHA: $COMMIT_SHA"
+      
+      - name: Check Dockerfile exists
+        run: |
+          cd ./target-repo
+          if [ ! -f "${{ env.DOCKERFILE_PATH }}" ]; then
+            echo "Error: Dockerfile not found at ${{ env.DOCKERFILE_PATH }}"
+            echo "Available files in repository root:"
+            ls -la
+            echo ""
+            echo "Searching for Dockerfile in subdirectories:"
+            find . -name "Dockerfile" -o -name "dockerfile"
+            exit 1
+          fi
+          echo "✓ Dockerfile found at ${{ env.DOCKERFILE_PATH }}"
+          echo "Building Polaris version: ${{ steps.repo_info.outputs.polaris_version }}"
+          echo "Using Alpine version: ${{ steps.repo_info.outputs.alpine_version }}"
+      
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.GHCR_IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=v${{ steps.repo_info.outputs.polaris_version }}
+            type=raw,value=${{ steps.commit.outputs.sha }}
+            type=raw,value=${{ github.event.inputs.custom_tag }},enable=${{ github.event.inputs.custom_tag != '' }}
+          labels: |
+            org.opencontainers.image.title=polaris
+            org.opencontainers.image.description=Built from ${{ steps.repo_info.outputs.repo }}
+            org.opencontainers.image.url=${{ steps.repo_info.outputs.repo }}
+            org.opencontainers.image.source=${{ steps.repo_info.outputs.repo }}
+            org.opencontainers.image.revision=${{ steps.commit.outputs.sha }}
+      
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./target-repo/${{ env.BUILD_CONTEXT }}
+          file: ./target-repo/${{ env.DOCKERFILE_PATH }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            ALPINE_VERSION=${{ steps.repo_info.outputs.alpine_version }}
+            POLARIS_VERSION=${{ steps.repo_info.outputs.polaris_version }}
+      
+      - name: Output build summary
+        run: |
+          echo "## Build Summary :rocket:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Source Repository:** \`${{ steps.repo_info.outputs.repo }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** \`${{ steps.repo_info.outputs.branch }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit SHA:** \`${{ steps.commit.outputs.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Polaris Version:** \`${{ steps.repo_info.outputs.polaris_version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Alpine Version:** \`${{ steps.repo_info.outputs.alpine_version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Target Image:** \`${{ env.GHCR_IMAGE_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Platforms:** \`linux/amd64, linux/arm64\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Tags" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.meta.outputs.tags }}" | tr ',' '\n' >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
